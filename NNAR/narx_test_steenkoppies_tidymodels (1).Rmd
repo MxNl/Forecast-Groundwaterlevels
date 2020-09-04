@@ -1,0 +1,468 @@
+---
+title: "Forecasting of a Groundwater Level Timeseries in Steenkoppies using Recurrent Neural Network (NARX)"
+author: "Kirsty Gibson, Maximilian Nölscher"
+date: "`r format(Sys.time(), '%d/%m/%Y')`"
+output:
+  html_document:
+    theme: lumen
+    highlight: tango
+    toc: TRUE
+    toc_float: TRUE
+    collapse: FALSE
+    toc_depth: 3
+    collapsed: FALSE
+    smooth_scroll: FALSE
+    number_sections: TRUE
+    self_contained: yes
+    df_print: paged
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+#klippy::klippy()
+```
+
+Source all external functions in folder functions
+```{r}
+purrr::map(
+  list.files(
+    path = './scripts/functions',
+    pattern = "\\.R$",
+    full.names = TRUE,
+    recursive = TRUE
+  ),
+  source
+)
+```
+
+
+Load Packages
+```{r}
+library(import)
+import::from(readxl, read_excel)
+import::from(janitor, clean_names, get_dupes)
+import::from(forecast, nnetar, forecast, accuracy)
+library(plotly)
+# library(Metrics)
+# library(doParallel)
+library(timetk)
+library(modeltime)
+library(tidymodels)
+library(tidyverse)
+library(Metrics)
+library(MLmetrics)
+library(hydroGOF)
+library(forecast)
+library(dplyr)
+library(recipes)
+library(timetk)
+library(devtools)
+
+```
+
+```{r}
+devtools::install_github("business-science/modeltime")
+```
+
+# Data Import
+```{r}
+data <- read_excel("C:/Users/Kirsty/Desktop/Steenkoppies Data/1. GWL background decline/A2N0612/A2N0612.xlsx")
+```
+
+Show the imported dataframe
+```{r}
+data
+```
+
+# Minor Preparations
+
+Clean column names
+```{r}
+data <- data %>% 
+  clean_names()
+```
+
+Cast date column as date
+```{r}
+data <- data %>% 
+  mutate(date = as.Date(date))
+```
+
+
+
+# Preprocessing
+Convert dataframe into long format
+```{r}
+data <- data %>% 
+  pivot_longer(cols = -date)
+```
+
+Plot the timeseries
+```{r}
+data %>% 
+  ggplot(aes(x = date, 
+             y = value)) + 
+  geom_line(colour = "steelblue") +
+  facet_wrap(~name, scales = "free_y", ncol = 1) +
+  theme_minimal()
+```
+
+Convert back to wide format
+```{r}
+data <- data %>% 
+  pivot_wider()
+```
+
+
+# Modelling
+
+Now we can start modelling the prepared timeseries. We will do this using the tidymodels framework.
+This helps us with data splitting (train, test, validation), hyperparameter tuning, normalization (scaling), resampling (timeseries cross-validation) and evaluating model performance. 
+
+We start with data splitting.
+
+## Data Splitting with `rsample`
+
+The following figure shows the general resampling strategy
+![Source: [Kuhn and Johnson (2019)](https://bookdown.org/max/FES/resampling.html)](figures/resampling.svg)
+
+We start with the train-test-split by using 90% as training data and the residual 10% as testing data.
+
+```{r}
+train_test_splits <- data %>% 
+  initial_time_split(prop = 0.9)
+```
+
+```{r}
+data_train <- 
+  train_test_splits %>% 
+  training()
+```
+
+```{r}
+data_test <- 
+  train_test_splits %>% 
+  testing()
+```
+
+Let's plot the train-test-split
+```{r, fig.height=1.6, fig.width=10}
+data_train %>% 
+  mutate(split = "training") %>% 
+  bind_rows(data_test) %>% 
+  replace_na(list(split = "testing")) %>% 
+  mutate(split = as.factor(split)) %>% 
+  ggplot(aes(date, gwl)) +
+  geom_line(aes(colour = split)) +
+  theme_minimal() +
+  scale_color_manual(values = c("training" = "#F8766D", "testing" = "#00BFC4")) +
+  labs(colour = "Split") +
+  scale_x_date(breaks = "2 years",
+               labels = lubridate::year)
+```
+
+
+## Resampling with `rsample`
+
+For defining the cross-validation split sizes we need to obtain some numbers on the sample size etc.
+Get total number of observations aka timesteps of the training set
+```{r}
+n_samples_train <- 
+  data_train %>% 
+  nrow()
+```
+
+Define initial split size to 50% of the total number of observations
+```{r}
+n_initial <- 
+  (n_samples_train * 0.5) %>% 
+  floor()
+```
+
+Define the size of the following slices to a fifth of the remaining number of observations
+```{r}
+n_slices <- 5
+```
+
+
+```{r}
+n_slice <- 
+  ((n_samples_train - n_initial) / n_slices) %>% 
+  floor()
+```
+
+Now we can define the resampling strategy
+```{r}
+resampling_strategy_cv5fold <- 
+  data_train %>%
+  time_series_cv(
+    initial = n_initial,
+    assess = n_slice,
+    skip = n_slice,
+    cumulative = TRUE
+  )
+```
+
+Plot the resampling strategy
+```{r, fig.width=10}
+resampling_strategy_cv5fold %>% 
+  tk_time_series_cv_plan() %>%  
+  ggplot(aes(date, gwl)) +
+  geom_line(aes(colour = .key)) +
+  facet_wrap(~.id, ncol = 1) +
+  theme_minimal() +
+  labs(colour = "Split") +
+  scale_x_date(breaks = "2 years",
+               labels = lubridate::year)
+```
+
+## Preprocessing with `recipe`
+
+All futher preprocessing steps such as normalization and feature engineering can be done using `recipe`
+We only normalize the data in the following recipe
+```{r}
+
+steenkopies_recipe <-
+
+  recipe(gwl ~ ., data = data_train) %>%
+
+  step_normalize(all_numeric(), -date)
+```
+
+## Defining a Learner with `parsnip` and `modeltime`
+
+Now we define a machine learning algorithm. We use a recurrent neural net (RNN) `nnetar()` from the `forecast` package which is implemented as `parsnip` model in the `modeltime` package.
+This specific RNN is similar to the [NARX](https://www.mathworks.com/help/deeplearning/ug/design-time-series-narx-feedback-neural-networks.html;jsessionid=9c66d64c96648c267982f4c17e83) model in Matlab. 
+
+ - We keep the hyperparameter seasonal_period fixed at 12 as 12 months is the annual seasonality
+ - We keep the hyperparameter num_networks fixed at 20 as we expect not much impact of this hyperparameter
+ - We tune all other hyperparameters by either using the default range or adapting it.
+ 
+
+```{r}
+tune_nnetar_model <-
+  nnetar_reg(
+    seasonal_period = 12,
+    non_seasonal_ar = tune(),
+    seasonal_ar = tune(),
+    hidden_units = tune(),
+    num_networks = 20,
+    penalty = tune(),
+    epochs = tune()
+  ) %>%
+  set_engine("nnetar", 
+             scale.inputs = FALSE) %>%
+  set_mode("regression")
+```
+
+
+## Parallelize Tuning
+
+Parallel computation would be good, but I couldn't get it working after a first trial.
+```{r}
+# all_cores <- parallel::detectCores(logical = FALSE)
+# 
+# cluster <- makePSOCKcluster(all_cores)
+# registerDoParallel(cluster)
+```
+
+```{r}
+# stopCluster(cluster)
+```
+
+
+## Tuning
+
+The setting of `n_levels` determines the number of values that are tried out for each hyperparameter. This causes an exponential growth of the number of models that need to be fitted.
+`n_levels` = 3 for these five hyperparameters took approximately 30 minutes to calculate on an average PC. So this is a trade-off situation between number of tuned hyperparameter, computing time and number of hyperparameter combinations. Maybe one can try tuning a smaller subset of hyperparameters and let it run over the weekend with `n_levles` = 20.
+```{r}
+n_levels <- 1
+```
+
+Define tuning method. We use a regular grid.
+```{r}
+tune_grid <- grid_regular(
+  non_seasonal_ar(range = c(1L, 5L)),
+  seasonal_ar(range = c(1L, 5L)),
+  hidden_units(),
+  # num_networks(),
+  penalty(),
+  epochs(),
+  levels = n_levels
+)
+```
+
+Number of parameter combinations and consequently model runs:
+```{r}
+tune_grid %>% 
+  nrow()
+```
+
+
+### Workflow
+We put all this together in a workflow...
+```{r}
+nnetar_workflow <- 
+  workflow() %>% 
+  add_model(tune_nnetar_model) %>% 
+  add_recipe(steenkopies_recipe)
+```
+
+### Model Fitting with Resamples
+...and fit the models using the defined workflow. This is the core code chunk which can run for a long time.
+```{r}
+nnetar_resampling <- 
+  nnetar_workflow %>% 
+  tune_grid(
+    resamples = resampling_strategy_cv5fold,
+    grid = tune_grid)
+    #metrics = metric_set(rmse, mae))
+```
+
+We choose a performance metrics (rmse or mae in this case)
+```{r}
+chosen_metric <- "rmse"
+```
+
+## Model Evaluation
+We look at the influence of the tuned hyperparameters on the model performance.
+```{r, fig.width=10, fig.height=6}
+nnetar_resampling %>% 
+  collect_metrics() %>% 
+  pivot_longer(cols = c("non_seasonal_ar", "seasonal_ar", "hidden_units", "penalty", "epochs")) %>% 
+  filter(.metric == chosen_metric) %>% 
+  group_by(name, value) %>% 
+  summarise(mean = mean(mean)) %>% 
+  ggplot(aes(value, mean)) +
+  geom_line(size = 1.5, 
+            alpha = 0.6,
+            colour = "#00BFC4") +
+  geom_point(size = 2,
+             colour = "#00BFC4") +
+  facet_wrap(~ name, scales = "free_x", ncol = 1) +
+  labs(y = "mean rmse") +
+  theme_minimal()
+```
+
+We display the best model among all models
+```{r}
+nnetar_resampling %>%
+  show_best(metric = chosen_metric)
+```
+
+We select the best model
+```{r}
+best_model <- 
+  nnetar_resampling %>% 
+  select_best(metric = chosen_metric)
+```
+
+We apply our workflow to the selected `best_model`
+```{r}
+final_workflow <- 
+  nnetar_workflow %>% 
+  finalize_workflow(best_model)
+```
+
+And we fit it to the whole training data split
+```{r}
+final_model <- 
+  final_workflow %>% 
+  fit(data = data_train)
+
+```
+
+
+We write the fitted model as modeltime_table
+```{r}
+models_tibble <- 
+  final_model %>% 
+  modeltime_table()
+```
+
+...and apply the model to the test data split
+```{r}
+calibration_tibble <- 
+  models_tibble %>% 
+  modeltime_calibrate(new_data = data_test)
+
+```
+
+We run the model on the test data split
+```{r, fig.width=10}
+best_model_forecast <- 
+  calibration_tibble %>%
+  modeltime_forecast(
+    new_data = data_test,
+    actual_data = data
+  )
+```
+
+```{r}
+extract_step_item <- function(recipe, step, item, enframe = TRUE) {
+  d <- recipe$steps[[which(purrr::map_chr(recipe$steps, ~ class(.)[1]) == step)]][[item]]
+  if (enframe) {
+    tibble::enframe(d) %>% tidyr::spread(key = 1, value = 2)
+  } else {
+    d
+  }
+}
+
+unnormalize <- function(x, rec, var) {
+  var_sd <- extract_step_item(rec, "step_normalize", "sds") %>% dplyr::pull(var)
+  var_mean <- extract_step_item(rec, "step_normalize", "means") %>% dplyr::pull(var)
+
+  (x * var_sd) + var_mean
+}
+
+unnormalize(new_data,steenkopies_recipe, gwl)
+```
+
+
+We can now plot the models result
+```{r}
+best_model_forecast %>%
+  plot_modeltime_forecast(.conf_interval_show = FALSE,
+    .legend_max_width = 25 # For mobile screens
+  )
+```
+
+We save the best model in `models_tibble`
+```{r}
+models_tibble %>% 
+  write_rds("data_processed/models_tibble_best_model.Rds")
+```
+
+We plot the actual vs. predicted values of the test data split as scatter plot to get another impression of the model performance.
+```{r}
+actual_vs_prediction_data <- 
+  best_model_forecast %>% 
+  get_dupes(.index) %>% 
+  select(.index, .key, .value) %>% 
+  pivot_wider(names_from = ".key",
+              values_from = ".value")
+
+axis_limits <- 
+  actual_vs_prediction_data %>% 
+  pivot_longer(cols = -".index") %>% 
+  pull(value) %>% 
+  range()
+  
+actual_vs_prediction_data %>% 
+  ggplot(aes(actual, prediction)) +
+  geom_point() +
+  coord_equal() +
+  geom_abline(linetype = "dashed",
+              colour = "grey",
+              alpha = .6,
+              size = 1) +
+  xlim(axis_limits) +
+  ylim(axis_limits) +
+  theme_minimal()
+```
+
